@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # 允许在 GitHub 网页上手动点击触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          pip install pandas openpyxl Pillow pyinstaller
+
+      - name: 打包为单文件 EXE
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "Amazon合并工具" `
+            --add-data "mascot.png;." `
+            --icon NONE `
+            main.py
+
+      - name: 上传 EXE 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Amazon合并工具-Windows
+          path: dist/Amazon合并工具.exe
+          retention-days: 30
