@@ -27,7 +27,7 @@ jobs:
           pyinstaller `
             --onefile `
             --windowed `
-            --name "Amazon合并工具" `
+            --name "Amazon-Invoice-Merger" `
             --add-data "mascot.png;." `
             --icon NONE `
             main.py
@@ -35,6 +35,6 @@ jobs:
       - name: 上传 EXE 产物
         uses: actions/upload-artifact@v4
         with:
-          name: Amazon合并工具-Windows
-          path: dist/Amazon合并工具.exe
+          name: Amazon-Invoice-Merger-Windows
+          path: dist/Amazon-Invoice-Merger.exe
           retention-days: 30
