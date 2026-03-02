@@ -405,15 +405,25 @@ class ExcelMergerApp(tk.Tk):
                     (existing or 0) + float(tax_excl_val), 4
                 )
 
-        # ── 3. 计算 O（不含税合计）和 P（含税合计）──
+        # ── 3. 读取 L4：发票含税总金额 ──
+        # L4 = 第4行第12列 = Total Tax-Inclusive Charge (GBP)
+        invoice_total_incl_tax = None
+        try:
+            raw_val = all_rows_raw[3][11]   # 行索引3=第4行，列索引11=L列
+            if raw_val is not None:
+                # 去掉千分位逗号后转为浮点数
+                invoice_total_incl_tax = float(str(raw_val).replace(",", ""))
+        except (IndexError, ValueError, TypeError):
+            invoice_total_incl_tax = None
+
+        # ── 4. 计算 O（不含税合计），P 固定为发票 L4 含税总金额 ──
         result = []
         for tid, rec in records.items():
             total_excl = sum(
                 rec[c] for c in CHARGE_COLS_OUTPUT if rec[c] is not None
             )
-            total_excl = round(total_excl, 2)
-            rec["合计（不含税）"]  = total_excl
-            rec["发票金额（含税）"] = round(total_excl * (1 + TAX_RATE), 2)
+            rec["合计（不含税）"]  = round(total_excl, 2)
+            rec["发票金额（含税）"] = invoice_total_incl_tax
             rec["备注"] = None
             result.append(rec)
 
