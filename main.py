@@ -424,13 +424,21 @@ class ExcelMergerApp(tk.Tk):
                 }
 
             val = float(tax_excl_val) if tax_excl_val is not None else 0.0
+            code_str = str(charge_code).strip() if charge_code else ""
 
             if ctype_str == "Shipping Charge Adjustment":
-                # O 列：所有 Adjustment 类型费用汇总
-                records[key][ADJ_COL] = round((records[key][ADJ_COL] or 0) + val, 4)
+                # 优先按 Charge Code 匹配到对应列（如 K=错误申报费、L=费率调整）
+                # 匹配不到的才汇总进 O 列（运费调整）
+                output_col = CHARGE_CODE_MAP.get(code_str)
+                if output_col:
+                    records[key][output_col] = round(
+                        (records[key][output_col] or 0) + val, 4
+                    )
+                else:
+                    records[key][ADJ_COL] = round((records[key][ADJ_COL] or 0) + val, 4)
             elif ctype_str in ("Shipping Charge", ""):
                 # H~N 列：按 Charge Code 分配
-                output_col = CHARGE_CODE_MAP.get(str(charge_code).strip())
+                output_col = CHARGE_CODE_MAP.get(code_str)
                 if output_col:
                     records[key][output_col] = round(
                         (records[key][output_col] or 0) + val, 4
