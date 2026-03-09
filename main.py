@@ -15,7 +15,7 @@ except ImportError:
     _PIL_OK = False
 
 # ─────────────────────── Amazon Invoice 处理常量 ───────────────────────
-# Invoice 文件里的 Charge Code → 输出列名（含中文备注）的映射，顺序即为 H~N 列
+# Charge Type = "Shipping Charge" 下的 Charge Code → 输出列名，顺序为 H~N
 CHARGE_CODE_MAP = {
     "Base charge":                                  "Base charge（基础运费）",
     "High Cube Surcharge":                          "High Cube Surcharge（体积附加费）",
@@ -27,6 +27,9 @@ CHARGE_CODE_MAP = {
 }
 CHARGE_COLS_OUTPUT = list(CHARGE_CODE_MAP.values())   # H~N
 
+# O 列：Charge Type = "Shipping Charge Adjustment" 的汇总
+ADJ_COL = "Shipping Charge Adjustment-运费调整"        # O
+
 OUTPUT_COLUMNS = [
     "Tracking ID",                  # A
     "To Postcode",                  # B
@@ -36,12 +39,11 @@ OUTPUT_COLUMNS = [
     "Width (cm)",                   # F
     "Height (cm)",                  # G
     *CHARGE_COLS_OUTPUT,            # H~N
-    "合计（不含税）",                # O = SUM(H:N)
-    "发票金额（含税）",              # P = O × 1.20
-    "备注",                         # Q
+    ADJ_COL,                        # O  Shipping Charge Adjustment
+    "合计（不含税）",                # P = SUM(H:O)
+    "发票金额（含税）",              # Q = L4 含税总额
+    "备注",                         # R
 ]
-
-TAX_RATE = 0.20
 
 # ─────────────────────── 颜色 & 字体常量 ───────────────────────
 BG_COLOR      = "#F5F6FA"   # 浅色主背景
@@ -332,6 +334,9 @@ class ExcelMergerApp(tk.Tk):
                 rows = self._process_invoice_file(path)
                 all_rows.extend(rows)
 
+            # 跨文件按 Invoice 号排序
+            all_rows.sort(key=lambda r: r.get("_invoice_number", ""))
+
             self.after(0, self._set_status, "写入文件…")
             self._write_output(all_rows, save_path)
             self.after(0, self._on_done, save_path, len(all_rows))
@@ -343,17 +348,35 @@ class ExcelMergerApp(tk.Tk):
         """
         解析单个 Amazon Invoice XLSX：
         - 自动定位表头行（含 'Tracking ID' 的行）
-        - 按 Tracking ID 分组，将各 Charge Code 透视为列
-        - 返回每个 Tracking ID 对应的一行字典
+        - 按 (Invoice号, Tracking ID) 分组，相同 TID 跨发票不合并
+        - Charge Type = Shipping Charge  → 透视各 Charge Code 为 H~N 列
+        - Charge Type = Shipping Charge Adjustment → 汇总到 O 列
+        - 按 Invoice 号排序后返回
         """
         wb = openpyxl.load_workbook(path, data_only=True)
         ws = wb.active
         all_rows_raw = list(ws.iter_rows(values_only=True))
         wb.close()
 
-        # ── 1. 定位表头行 ──
+        # ── 1. 读取发票元数据（前4行） ──
+        # G2 = Invoice number（第2行第7列）
+        try:
+            invoice_number = str(all_rows_raw[1][6] or "")
+        except IndexError:
+            invoice_number = ""
+
+        # L4 = Total Tax-Inclusive Charge（第4行第12列）
+        invoice_total_incl_tax = None
+        try:
+            raw_val = all_rows_raw[3][11]
+            if raw_val is not None:
+                invoice_total_incl_tax = float(str(raw_val).replace(",", ""))
+        except (IndexError, ValueError, TypeError):
+            invoice_total_incl_tax = None
+
+        # ── 2. 定位表头行 ──
         header_row_idx = None
-        col_map: dict[str, int] = {}   # 列名 → 0-based 索引
+        col_map: dict[str, int] = {}
         for r_idx, row in enumerate(all_rows_raw, 1):
             if row and "Tracking ID" in row:
                 header_row_idx = r_idx
@@ -362,13 +385,13 @@ class ExcelMergerApp(tk.Tk):
         if header_row_idx is None:
             raise ValueError(f"未在文件中找到表头行（含 'Tracking ID'）：\n{path}")
 
-        # ── 2. 读取所有数据行 ──
+        # ── 3. 读取数据行，按 (invoice_number, tid) 分组 ──
         def col(row_vals, name):
             idx = col_map.get(name)
             return row_vals[idx] if idx is not None and idx < len(row_vals) else None
 
-        # Tracking ID → 汇总字典
-        records: dict[str, dict] = {}
+        # key: (invoice_number, tid) → 汇总字典
+        records: dict[tuple, dict] = {}
 
         for row in all_rows_raw[header_row_idx:]:
             tid = col(row, "Tracking ID")
@@ -379,15 +402,16 @@ class ExcelMergerApp(tk.Tk):
             charge_type  = col(row, "Charge Type")
             tax_excl_val = col(row, "Tax Exclusive Charge Value (GBP)")
 
-            # 跳过汇总行（Charge Code 为空，即 Total 行）
+            # 跳过汇总行（Charge Code 为空 = Total 小计行）
             if not charge_code:
                 continue
-            # 跳过 Adjustment 类型的行（如整张发票的期末调整，不对应单个包裹）
-            if charge_type and str(charge_type).strip() == "Shipping Charge Adjustment":
-                continue
 
-            if tid not in records:
-                records[tid] = {
+            ctype_str = str(charge_type).strip() if charge_type else ""
+            key = (invoice_number, str(tid))
+
+            if key not in records:
+                records[key] = {
+                    "_invoice_number":    invoice_number,
                     "Tracking ID":        tid,
                     "To Postcode":        col(row, "To Postcode"),
                     "Reference":          col(row, "Reference"),
@@ -396,37 +420,36 @@ class ExcelMergerApp(tk.Tk):
                     "Width (cm)":         col(row, "Width (cm)"),
                     "Height (cm)":        col(row, "Height (cm)"),
                     **{v: None for v in CHARGE_CODE_MAP.values()},
+                    ADJ_COL: None,
                 }
 
-            output_col_name = CHARGE_CODE_MAP.get(str(charge_code).strip())
-            if output_col_name and tax_excl_val is not None:
-                existing = records[tid].get(output_col_name)
-                records[tid][output_col_name] = round(
-                    (existing or 0) + float(tax_excl_val), 4
-                )
+            val = float(tax_excl_val) if tax_excl_val is not None else 0.0
 
-        # ── 3. 读取 L4：发票含税总金额 ──
-        # L4 = 第4行第12列 = Total Tax-Inclusive Charge (GBP)
-        invoice_total_incl_tax = None
-        try:
-            raw_val = all_rows_raw[3][11]   # 行索引3=第4行，列索引11=L列
-            if raw_val is not None:
-                # 去掉千分位逗号后转为浮点数
-                invoice_total_incl_tax = float(str(raw_val).replace(",", ""))
-        except (IndexError, ValueError, TypeError):
-            invoice_total_incl_tax = None
+            if ctype_str == "Shipping Charge Adjustment":
+                # O 列：所有 Adjustment 类型费用汇总
+                records[key][ADJ_COL] = round((records[key][ADJ_COL] or 0) + val, 4)
+            elif ctype_str in ("Shipping Charge", ""):
+                # H~N 列：按 Charge Code 分配
+                output_col = CHARGE_CODE_MAP.get(str(charge_code).strip())
+                if output_col:
+                    records[key][output_col] = round(
+                        (records[key][output_col] or 0) + val, 4
+                    )
 
-        # ── 4. 计算 O（不含税合计），P 固定为发票 L4 含税总金额 ──
+        # ── 4. 计算合计列，注入发票元数据 ──
         result = []
-        for tid, rec in records.items():
+        for key, rec in records.items():
             total_excl = sum(
                 rec[c] for c in CHARGE_COLS_OUTPUT if rec[c] is not None
             )
-            rec["合计（不含税）"]  = round(total_excl, 2)
+            adj = rec[ADJ_COL] or 0
+            rec["合计（不含税）"]  = round(total_excl + adj, 2)
             rec["发票金额（含税）"] = invoice_total_incl_tax
             rec["备注"] = None
             result.append(rec)
 
+        # 按 Invoice 号排序（同一文件内已有序，跨文件合并后再统一排序）
+        result.sort(key=lambda r: r["_invoice_number"])
         return result
 
     # ─── 写出 Excel ───
@@ -462,8 +485,9 @@ class ExcelMergerApp(tk.Tk):
             cell.border    = border
 
         # ── 写数据 ──
-        o_col_idx = OUTPUT_COLUMNS.index("合计（不含税）") + 1   # 列号（1-based）
-        p_col_idx = OUTPUT_COLUMNS.index("发票金额（含税）") + 1
+        adj_col_idx = OUTPUT_COLUMNS.index(ADJ_COL) + 1          # O 列
+        o_col_idx   = OUTPUT_COLUMNS.index("合计（不含税）") + 1  # P 列
+        p_col_idx   = OUTPUT_COLUMNS.index("发票金额（含税）") + 1 # Q 列
 
         for r_idx, rec in enumerate(rows, 2):
             is_even = (r_idx % 2 == 0)
@@ -479,16 +503,24 @@ class ExcelMergerApp(tk.Tk):
                 # 数值格式
                 if col_name in ("Billable weight (kg)",):
                     cell.number_format = num_fmt_4
-                elif c_idx in range(8, o_col_idx + 1):   # H~O 费用列
+                elif c_idx in range(8, o_col_idx + 1):   # H~P 费用+合计列
                     if value is not None:
                         cell.number_format = num_fmt_2
 
-                # O 列特殊样式
-                if c_idx == o_col_idx:
+                # O 列（Adjustment）浅紫色
+                if c_idx == adj_col_idx:
+                    if r_idx == 1:
+                        pass  # 表头已统一处理
+                    else:
+                        cell.number_format = num_fmt_2
+                        if row_bg:
+                            cell.fill = PatternFill("solid", fgColor="EDE7F6")
+                # P 列（合计不含税）橙黄
+                elif c_idx == o_col_idx:
                     cell.fill   = o_fill
                     cell.font   = o_font
                     cell.number_format = num_fmt_2
-                # P 列特殊样式
+                # Q 列（含税）绿
                 elif c_idx == p_col_idx:
                     cell.fill   = p_fill
                     cell.font   = p_font
